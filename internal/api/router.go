@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -219,24 +220,48 @@ func decodePluginParams(raw map[string]json.RawMessage) (map[string]string, bool
 	if !present {
 		return nil, false
 	}
-	// Decode members as any first: unmarshalling straight into map[string]string
-	// accepts a JSON null member as the empty string. The published contract is a
-	// string-to-string object, so null, numbers, booleans, arrays and nested
-	// objects are invalid input rather than coerced or dropped.
-	var members map[string]any
-	if err := json.Unmarshal(blob, &members); err != nil {
+	// Decode members as a token stream: unmarshalling into a map keeps only the
+	// final value of a duplicated member name, which would hide an earlier
+	// non-string value. The published contract is a string-to-string object and
+	// any non-string occurrence — null, number, boolean, array or nested object,
+	// whether it appears before or after a legal string for the same name —
+	// rejects the whole registration. Member names are compared after JSON
+	// unescaping, so an escape-encoded spelling of a name collides with its
+	// plain spelling; when every occurrence is a legal string the last one wins.
+	decoder := json.NewDecoder(bytes.NewReader(blob))
+	opening, err := decoder.Token()
+	if err != nil {
 		return nil, false
 	}
-	if members == nil {
+	if delim, ok := opening.(json.Delim); !ok || delim != '{' {
 		return nil, false
 	}
-	params := make(map[string]string, len(members))
-	for key, value := range members {
+	params := make(map[string]string)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false
+		}
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
 		str, ok := value.(string)
 		if !ok {
 			return nil, false
 		}
 		params[key] = str
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return nil, false
+	}
+	if delim, ok := closing.(json.Delim); !ok || delim != '}' {
+		return nil, false
 	}
 	return params, true
 }
