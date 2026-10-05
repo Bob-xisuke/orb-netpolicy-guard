@@ -8,6 +8,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +23,13 @@ import (
 	"github.com/Bob-xisuke/orb-netpolicy-guard/internal/store"
 )
 
-const clientTimeout = 10 * time.Second
+const (
+	clientTimeout = 10 * time.Second
+	// roundBudget bounds every wait inside one round (reader startup, the
+	// whole write burst, reader shutdown): waiting longer than ten seconds
+	// fails the round rather than hanging the suite.
+	roundBudget = 10 * time.Second
+)
 
 const (
 	raceNamespace = "payments"
@@ -183,19 +190,79 @@ func decodeRecord(t *testing.T, raw []byte) map[string]any {
 	return record
 }
 
+// formatPostOutcomes renders every collected POST result so a failure reports
+// the request kind, status, transport error and body the round actually saw.
+func formatPostOutcomes(results []postOutcome) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "collected %d POST outcome(s):", len(results))
+	for i, r := range results {
+		fmt.Fprintf(&b, "\n  [%d] kind=%s status=%d err=%v body=%s",
+			i, r.kind, r.status, r.err, string(r.body))
+	}
+	return b.String()
+}
+
+// formatQueryObservations renders every GET observation collected during the
+// registration burst.
+func formatQueryObservations(observations []queryObservation) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "collected %d GET observation(s):", len(observations))
+	for i, o := range observations {
+		fmt.Fprintf(&b, "\n  [%d] target=%s status=%d err=%v body=%s",
+			i, o.target, o.status, o.err, string(o.body))
+	}
+	return b.String()
+}
+
+// drainOutcomes snapshots whatever POST outcomes have arrived so far; used to
+// report partial results when the burst does not finish inside the round budget.
+func drainOutcomes(ch <-chan postOutcome) []postOutcome {
+	results := make([]postOutcome, 0, cap(ch))
+	for {
+		select {
+		case r := <-ch:
+			results = append(results, r)
+		default:
+			return results
+		}
+	}
+}
+
+// drainObservations snapshots the GET observations gathered so far.
+func drainObservations(ch <-chan queryObservation) []queryObservation {
+	observations := make([]queryObservation, 0)
+	for {
+		select {
+		case o := <-ch:
+			observations = append(observations, o)
+		default:
+			return observations
+		}
+	}
+}
+
 // Empty store, same namespace and policy name: two content groups differing in
 // one legal plugin string value race to register, each group including
 // equivalent submissions with object members reordered, alongside requests
 // carrying a null plugin member and queries issued during the burst. Exactly
 // one 201 fixes the winning content; the winning group's other requests return
 // 200 with that same record, the losing group all 409, and the null requests
-// all 400. Queries observe either 404 or the single complete winning record.
+// all 400. Queries are proven 404 against the empty store beforehand; during
+// the burst every observation is either 404 or 200 carrying the single eventual
+// winning record, but observing either state mid-flight is never itself a pass
+// condition — all writes are allowed to finish before the next read is
+// scheduled. Final state is checked through both filters and their intersection.
 func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 	// Repeat against fresh databases: the winning group may differ per round.
 	for round := 0; round < 3; round++ {
-		t.Run("round", func(t *testing.T) {
+		t.Run(fmt.Sprintf("round%d", round), func(t *testing.T) {
 			server, _ := newConcurrentTestServer(t)
 			client := &http.Client{Timeout: clientTimeout}
+
+			// One deadline covers every wait in the round: readers becoming
+			// ready, the whole write burst and reader shutdown.
+			deadline := time.NewTimer(roundBudget)
+			defer deadline.Stop()
 
 			submissions := []struct {
 				kind string
@@ -213,19 +280,34 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 				{"null", raceBodyNullMember},
 			}
 
-			// Readers start before the writers are released so the empty-store
-			// window is genuinely queried, and keep going until every write
-			// request has returned. Each reader reports after its first
-			// observation; the test releases the writers only after some
-			// readers have queried the still-empty store.
-			stopReaders := make(chan struct{})
-			readerReady := make(chan struct{}, 4)
-			var readers sync.WaitGroup
-			observations := make(chan queryObservation, 65536)
 			queryTargets := []string{
 				server.URL + "/v1/net-policies?namespace=payments",
 				server.URL + "/v1/net-policies?label=tier%3Dbackend",
 			}
+			intersectionTarget := server.URL + "/v1/net-policies?namespace=payments&label=tier%3Dbackend"
+
+			// Deterministic pre-registration check: a query on the empty store
+			// is 404 with the published shape, for both filters. The concurrent
+			// readers below therefore never need to "happen to" catch 404.
+			for _, target := range queryTargets {
+				status, body, err := clientRequest(client, http.MethodGet, target, "")
+				if err != nil {
+					t.Fatalf("pre-registration GET %s failed: %v", target, err)
+				}
+				assertExactErrorBytes(t, status, body, http.StatusNotFound, "NetPolicyNotFoundError")
+			}
+
+			// Readers run while the burst is in flight and stop only once every
+			// write has returned. stop runs on every exit path (including a
+			// fatal failure) so goroutines and the server are always released.
+			stopReaders := make(chan struct{})
+			var stopOnce sync.Once
+			stop := func() { stopOnce.Do(func() { close(stopReaders) }) }
+			t.Cleanup(stop)
+
+			readerReady := make(chan struct{}, 4)
+			var readers sync.WaitGroup
+			observations := make(chan queryObservation, 65536)
 			for i := 0; i < 4; i++ {
 				readers.Add(1)
 				go func(id int) {
@@ -251,8 +333,17 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 					}
 				}(i)
 			}
-			<-readerReady
-			<-readerReady
+
+			// Release writers only after readers are already querying; whether
+			// a reader then catches the committed row is left to scheduling.
+			for ready := 0; ready < 2; ready++ {
+				select {
+				case <-readerReady:
+				case <-deadline.C:
+					t.Fatalf("round timed out before %d readers became ready\n%s",
+						2, formatQueryObservations(drainObservations(observations)))
+				}
+			}
 
 			start := make(chan struct{})
 			var writers sync.WaitGroup
@@ -272,19 +363,47 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 			}
 
 			close(start)
-			writers.Wait()
-			close(stopReaders)
-			readers.Wait()
-			close(observations)
+			writersDone := make(chan struct{})
+			go func() {
+				writers.Wait()
+				close(writersDone)
+			}()
+			select {
+			case <-writersDone:
+			case <-deadline.C:
+				partial := drainOutcomes(outcomes)
+				t.Fatalf("round timed out waiting for the registration burst to finish\n%s\n%s",
+					formatPostOutcomes(partial),
+					formatQueryObservations(drainObservations(observations)))
+			}
 
-			results := make([]postOutcome, 0, len(submissions))
-			for range submissions {
-				results = append(results, <-outcomes)
+			// All writes are allowed to complete before readers wind down:
+			// catching 200 during this window is best-effort, never required.
+			stop()
+			readersDone := make(chan struct{})
+			go func() {
+				readers.Wait()
+				close(readersDone)
+			}()
+			select {
+			case <-readersDone:
+			case <-deadline.C:
+				t.Fatalf("round timed out stopping readers\n%s\n%s",
+					formatPostOutcomes(drainOutcomes(outcomes)),
+					formatQueryObservations(drainObservations(observations)))
+			}
+
+			results := drainOutcomes(outcomes)
+			raceObservations := drainObservations(observations)
+			if len(results) != len(submissions) {
+				t.Fatalf("collected %d POST results, want %d\n%s",
+					len(results), len(submissions), formatPostOutcomes(results))
 			}
 
 			for _, result := range results {
 				if result.err != nil {
-					t.Fatalf("POST %s failed: %v", result.kind, result.err)
+					t.Fatalf("POST %s failed: %v\n%s", result.kind, result.err,
+						formatPostOutcomes(results))
 				}
 			}
 
@@ -309,18 +428,22 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 				case http.StatusBadRequest:
 					rejected++
 				default:
-					t.Fatalf("unexpected POST status %d: %s", result.status, string(result.body))
+					t.Fatalf("unexpected POST status %d for kind %s: %s\n%s",
+						result.status, result.kind, string(result.body),
+						formatPostOutcomes(results))
 				}
 			}
 			if created != 1 {
-				t.Fatalf("created = %d responses, want exactly one 201", created)
+				t.Fatalf("created = %d responses, want exactly one 201\n%s",
+					created, formatPostOutcomes(results))
 			}
 			if mode, _ := winner["pluginParams"].(map[string]any)["mode"].(string); mode == "enforce" {
 				winnerKind = "A"
 			} else if mode == "audit" {
 				winnerKind = "B"
 			} else {
-				t.Fatalf("winning record pluginParams.mode = %v, want enforce or audit", winner["pluginParams"])
+				t.Fatalf("winning record pluginParams.mode = %v, want enforce or audit\nwinner=%v",
+					winner["pluginParams"], winner)
 			}
 			t.Logf("group %s (mode=%s) won the registration race", winnerKind,
 				winner["pluginParams"].(map[string]any)["mode"])
@@ -342,8 +465,8 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 					// Remaining requests with the winning content are idempotent
 					// retries: 200 with the same original record.
 					if result.status != http.StatusOK {
-						t.Fatalf("winning group peer status = %d, want 200: %s",
-							result.status, string(result.body))
+						t.Fatalf("winning group peer status = %d, want 200: %s\n%s",
+							result.status, string(result.body), formatPostOutcomes(results))
 					}
 					if got := decodeRecord(t, result.body); !reflect.DeepEqual(got, winner) {
 						t.Fatalf("200 record = %v, want the original winning record %v", got, winner)
@@ -360,59 +483,62 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 				}
 			}
 			if winnerPeers != 3 {
-				t.Fatalf("winning group 200 peers = %d, want 3", winnerPeers)
+				t.Fatalf("winning group 200 peers = %d, want 3\n%s",
+					winnerPeers, formatPostOutcomes(results))
 			}
 			if loserPeers != 4 {
-				t.Fatalf("losing group 409 responses = %d, want 4", loserPeers)
+				t.Fatalf("losing group 409 responses = %d, want 4\n%s",
+					loserPeers, formatPostOutcomes(results))
 			}
 			if rejected != 2 || okStatus != 3 {
-				t.Fatalf("status counts: 200=%d 400=%d, want 200=3 400=2", okStatus, rejected)
+				t.Fatalf("status counts: 200=%d 400=%d, want 200=3 400=2\n%s",
+					okStatus, rejected, formatPostOutcomes(results))
 			}
 
-			// Queries observed during the race: 404 before anything committed,
-			// or 200 with exactly one complete record — always the eventual
-			// winner, never a duplicate identity, a losing content or a mix.
-			sawNotFound, sawFound := false, false
-			for observation := range observations {
+			// Every query observed during the burst is legal: 404, or 200 with
+			// exactly one complete record — always the eventual winner, never a
+			// duplicate identity, losing content or a field mix. Whether either
+			// state was sampled is deliberately irrelevant; all writes may have
+			// finished before the next scheduled read.
+			for _, observation := range raceObservations {
 				if observation.err != nil {
-					t.Fatalf("GET %s failed: %v", observation.target, observation.err)
+					t.Fatalf("GET %s failed: %v\n%s", observation.target, observation.err,
+						formatQueryObservations(raceObservations))
 				}
 				switch observation.status {
 				case http.StatusNotFound:
 					assertExactErrorBytes(t, observation.status, observation.body,
 						http.StatusNotFound, "NetPolicyNotFoundError")
-					sawNotFound = true
 				case http.StatusOK:
 					var body struct {
 						Items []map[string]any `json:"items"`
 					}
 					if err := json.Unmarshal(observation.body, &body); err != nil {
-						t.Fatalf("decode items: %v", err)
+						t.Fatalf("decode items: %v\n%s", err,
+							formatQueryObservations(raceObservations))
 					}
 					if len(body.Items) != 1 {
-						t.Fatalf("GET %s returned %d items, want exactly one identity: %s",
-							observation.target, len(body.Items), string(observation.body))
+						t.Fatalf("GET %s returned %d items, want exactly one identity: %s\n%s",
+							observation.target, len(body.Items), string(observation.body),
+							formatQueryObservations(raceObservations))
 					}
 					if !reflect.DeepEqual(body.Items[0], winner) {
 						t.Fatalf("GET %s item = %v, want the complete winning record %v",
 							observation.target, body.Items[0], winner)
 					}
-					sawFound = true
 				default:
-					t.Fatalf("GET during race status = %d: %s",
-						observation.status, string(observation.body))
+					t.Fatalf("GET during race status = %d for %s: %s\n%s",
+						observation.status, observation.target, string(observation.body),
+						formatQueryObservations(raceObservations))
 				}
 			}
-			if !sawNotFound {
-				t.Fatalf("no 404 was observed while the registration burst was in flight")
-			}
-			if !sawFound {
-				t.Fatalf("no 200 query was observed while the registration burst was in flight")
-			}
+			t.Logf("observed %d queries during the burst (%d goroutines)",
+				len(raceObservations), 4)
 
-			// Final state through both filters: only the winner, identical in
-			// every submitted field plus order and conflict.
-			for _, target := range queryTargets {
+			// Committed state after registration: both filters and their
+			// intersection return only the winner, identical in every submitted
+			// field plus order and conflict.
+			for _, target := range append(queryTargets, intersectionTarget) {
 				status, body, err := clientRequest(client, http.MethodGet, target, "")
 				if err != nil {
 					t.Fatalf("final GET %s: %v", target, err)
@@ -432,7 +558,8 @@ func TestConcurrentHTTPSameIdentityRace(t *testing.T) {
 			}
 
 			// Failed 409s, 400s and 200 retries consumed no order: the next
-			// brand-new identity takes order 2.
+			// brand-new identity (egress, so no rule clash with the winner)
+			// takes order 2.
 			nextBody := singleRuleBody(raceNamespace, "after-race", raceLabel,
 				"egress", "allow", 53, 53, `{}`)
 			status, body, err := clientRequest(client, http.MethodPost,
