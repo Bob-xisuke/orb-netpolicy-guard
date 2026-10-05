@@ -54,7 +54,7 @@ go run .
 
 - `namespace`、`name`、`label`：必填的非空白字符串；`namespace` 与 `name` 共同确定记录身份，按原值匹配。
 - `rules`：必填的非空数组，顺序有意义。每条规则含 `direction`（`ingress` 或 `egress`）、`action`（`allow` 或 `deny`）、`ports`（两个整数构成的闭区间，1–65535，起点不大于终点）。
-- `pluginParams`：必填的字符串键值对象，可为空对象。
+- `pluginParams`：必填的字符串键值对象，可为空对象。每个成员的值必须是 JSON 字符串（空字符串、纯空白字符串均合法，按原值保存）；只要任一成员值为 `null`、数字、布尔值、数组或对象，整次登记即判为非法输入返回 400，不做字符串转换、不忽略该成员、不写入任何记录。
 
 首次登记返回 201，响应对象包含提交字段以及 `order`（全局生效顺序，从 1 递增）和 `conflict`（与同命名空间、同标签的已提交记录存在同方向、相反动作且端口重叠的规则时为 `true`）。同身份同内容重试返回 200 与原记录，不占用顺序；同身份不同内容返回 409 与 `NetPolicyConflictError`。输入非法返回 400 与 `InvalidNetPolicyInputError`，不写入任何记录。
 

@@ -219,12 +219,24 @@ func decodePluginParams(raw map[string]json.RawMessage) (map[string]string, bool
 	if !present {
 		return nil, false
 	}
-	params := map[string]string{}
-	if err := json.Unmarshal(blob, &params); err != nil {
+	// Decode members as any first: unmarshalling straight into map[string]string
+	// accepts a JSON null member as the empty string. The published contract is a
+	// string-to-string object, so null, numbers, booleans, arrays and nested
+	// objects are invalid input rather than coerced or dropped.
+	var members map[string]any
+	if err := json.Unmarshal(blob, &members); err != nil {
 		return nil, false
 	}
-	if params == nil {
+	if members == nil {
 		return nil, false
+	}
+	params := make(map[string]string, len(members))
+	for key, value := range members {
+		str, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		params[key] = str
 	}
 	return params, true
 }
