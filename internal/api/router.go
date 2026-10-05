@@ -214,17 +214,32 @@ func requiredEnum(raw map[string]json.RawMessage, key string, allowed ...string)
 	return "", false
 }
 
+// decodePluginParams reads a present JSON object all of whose members are
+// JSON strings. The object may be empty. Each member is first decoded into an
+// any and then type-asserted: JSON null unmarshals into a Go nil (and would
+// unmarshal into the zero string without an error), so it — along with
+// numbers, booleans, arrays and objects — is rejected instead of being
+// coerced into the empty string or dropped.
 func decodePluginParams(raw map[string]json.RawMessage) (map[string]string, bool) {
 	blob, present := raw["pluginParams"]
 	if !present {
 		return nil, false
 	}
-	params := map[string]string{}
-	if err := json.Unmarshal(blob, &params); err != nil {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(blob, &members); err != nil || members == nil {
 		return nil, false
 	}
-	if params == nil {
-		return nil, false
+	params := make(map[string]string, len(members))
+	for key, member := range members {
+		var value any
+		if err := json.Unmarshal(member, &value); err != nil {
+			return nil, false
+		}
+		str, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		params[key] = str
 	}
 	return params, true
 }
