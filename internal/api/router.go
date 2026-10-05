@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -214,29 +215,61 @@ func requiredEnum(raw map[string]json.RawMessage, key string, allowed ...string)
 	return "", false
 }
 
+// decodePluginParams validates and decodes the pluginParams object. The published
+// contract is a string-to-string object: null, numbers, booleans, arrays and
+// nested objects are invalid input rather than coerced or dropped.
+//
+// Members are walked with a streaming decoder so every occurrence of a repeated
+// member name is inspected, not just the value a map decode would keep last.
+// {"mode":null,"mode":"enforce"} must fail on the null even though a legal
+// string follows it; keys are matched after JSON unescaping, so "mode" and
+// "mode" are the same member. When every occurrence is a string the last
+// value for each decoded key wins. Only a top-level object appearing once is
+// accepted here; other fields keep their existing parsing behaviour.
 func decodePluginParams(raw map[string]json.RawMessage) (map[string]string, bool) {
 	blob, present := raw["pluginParams"]
 	if !present {
 		return nil, false
 	}
-	// Decode members as any first: unmarshalling straight into map[string]string
-	// accepts a JSON null member as the empty string. The published contract is a
-	// string-to-string object, so null, numbers, booleans, arrays and nested
-	// objects are invalid input rather than coerced or dropped.
-	var members map[string]any
-	if err := json.Unmarshal(blob, &members); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(blob))
+	opening, err := decoder.Token()
+	if err != nil {
 		return nil, false
 	}
-	if members == nil {
+	delim, ok := opening.(json.Delim)
+	if !ok || delim != '{' {
+		// Rejects null, scalars and arrays outright.
 		return nil, false
 	}
-	params := make(map[string]string, len(members))
-	for key, value := range members {
-		str, ok := value.(string)
+
+	params := map[string]string{}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := keyToken.(string)
 		if !ok {
 			return nil, false
 		}
-		params[key] = str
+		valueToken, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		value, ok := valueToken.(string)
+		if !ok {
+			return nil, false
+		}
+		params[key] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, false
+	}
+
+	// The RawMessage must contain exactly the object and nothing trailing.
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
 	}
 	return params, true
 }

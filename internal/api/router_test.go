@@ -585,6 +585,245 @@ func TestPostNetPolicyLegalChangeStillConflicts(t *testing.T) {
 	}
 }
 
+// A repeated member name must not let an illegal value hide behind a later
+// string: every occurrence in pluginParams is validated, whether the illegal
+// value lands before or after the legal one, adjacent to it or separated by
+// another member, and whether the shared name is written literally or with a
+// JSON escape ("mode" and "\u006dode" decode to the same key).
+func TestPostNetPolicyRejectsIllegalValueHiddenByDuplicateMember(t *testing.T) {
+	cases := map[string]string{
+		"null before legal string, adjacent":       `{"mode": null, "mode": "enforce"}`,
+		"null after legal string, adjacent":        `{"mode": "enforce", "mode": null}`,
+		"null before legal string, separated":      `{"mode": null, "retries": "3", "mode": "enforce"}`,
+		"null after legal string, separated":       `{"mode": "enforce", "retries": "3", "mode": null}`,
+		"number hidden by later string":            `{"mode": 1, "mode": "enforce"}`,
+		"boolean hidden by later string":           `{"mode": true, "mode": "enforce"}`,
+		"array hidden by later string":             `{"mode": ["enforce"], "mode": "enforce"}`,
+		"object hidden by later string":            `{"mode": {"x": 1}, "mode": "enforce"}`,
+		"legal string hidden by later null":        `{"mode": "enforce", "mode": null}`,
+		"escaped name null first, literal legal":   `{"\u006dode": null, "mode": "enforce"}`,
+		"literal legal first, escaped name null":   `{"mode": "enforce", "\u006dode": null}`,
+		"escaped name number, literal legal after": `{"\u006dode": 7, "mode": "enforce"}`,
+		"two illegal occurrences around a legal":   `{"mode": false, "retries": "3", "mode": null}`,
+	}
+	for name, params := range cases {
+		t.Run(name, func(t *testing.T) {
+			router, _ := newTestRouter(t)
+			bad := policyBody("payments", "default-deny", "tier=backend", params)
+
+			recorder := doRequest(router, http.MethodPost, "/v1/net-policies", bad)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			assertErrorCode(t, recorder, "InvalidNetPolicyInputError")
+			assertSafeErrorMessage(t, recorder)
+
+			// A rejected new identity leaves no record behind.
+			for _, target := range []string{
+				"/v1/net-policies?namespace=payments",
+				"/v1/net-policies?label=tier%3Dbackend",
+			} {
+				miss := doRequest(router, http.MethodGet, target, "")
+				if miss.Code != http.StatusNotFound {
+					t.Fatalf("GET %s status = %d, want %d", target, miss.Code, http.StatusNotFound)
+				}
+				assertErrorCode(t, miss, "NetPolicyNotFoundError")
+			}
+
+			// The rejected registration must not consume an order value.
+			good := policyBody("payments", "default-deny", "tier=backend", `{"mode": "enforce"}`)
+			created := doRequest(router, http.MethodPost, "/v1/net-policies", good)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("valid status = %d, want %d: %s", created.Code, http.StatusCreated, created.Body.String())
+			}
+			var stored map[string]any
+			if err := json.Unmarshal(created.Body.Bytes(), &stored); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if stored["order"] != float64(1) {
+				t.Fatalf("order = %v, want 1 (rejected request must not consume an order)", stored["order"])
+			}
+		})
+	}
+}
+
+// Posting a duplicate-name pluginParams against an existing identity is invalid
+// input whenever any occurrence is non-string, even if the final value equals
+// the stored one (never 200) or differs (never 409). The committed record, its
+// order and its conflict flag stay untouched.
+func TestPostNetPolicyDuplicateMemberIllegalOnExistingIdentity(t *testing.T) {
+	cases := []struct {
+		name        string
+		retryParams string
+	}{
+		{"illegal hidden by value equal to stored", `{"mode": null, "mode": "enforce"}`},
+		{"illegal hidden by value differing stored", `{"mode": null, "mode": "audit"}`},
+		{"legal then illegal, final differs", `{"mode": "enforce", "retries": "3", "mode": null}`},
+		{"escaped illegal occurrence", `{"mode": "enforce", "\u006dode": null}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := newTestRouter(t)
+			// A clashing rule first so the seed record carries conflict=true,
+			// which the rejected retry must leave intact.
+			clash := policyWithRules("payments", "clash", "tier=backend",
+				`[{"direction":"ingress","action":"deny","ports":[80,80]}]`, `{}`)
+			if rec := doRequest(router, http.MethodPost, "/v1/net-policies", clash); rec.Code != http.StatusCreated {
+				t.Fatalf("clash seed status = %d: %s", rec.Code, rec.Body.String())
+			}
+			seed := doRequest(router, http.MethodPost, "/v1/net-policies",
+				policyBody("payments", "default-deny", "tier=backend", `{"mode": "enforce"}`))
+			if seed.Code != http.StatusCreated {
+				t.Fatalf("seed status = %d: %s", seed.Code, seed.Body.String())
+			}
+			var seedRecord map[string]any
+			if err := json.Unmarshal(seed.Body.Bytes(), &seedRecord); err != nil {
+				t.Fatalf("decode seed: %v", err)
+			}
+			if seedRecord["conflict"] != true {
+				t.Fatalf("seed conflict = %v, want true", seedRecord["conflict"])
+			}
+
+			retry := doRequest(router, http.MethodPost, "/v1/net-policies",
+				policyBody("payments", "default-deny", "tier=backend", tc.retryParams))
+			if retry.Code != http.StatusBadRequest {
+				t.Fatalf("retry status = %d, want %d (never 200 or 409): %s",
+					retry.Code, http.StatusBadRequest, retry.Body.String())
+			}
+			assertErrorCode(t, retry, "InvalidNetPolicyInputError")
+			assertSafeErrorMessage(t, retry)
+
+			items := listItems(t, router, "/v1/net-policies?namespace=payments")
+			if len(items) != 2 {
+				t.Fatalf("items = %v, want the two original records only", items)
+			}
+			var original map[string]any
+			for _, item := range items {
+				if item["name"] == "default-deny" {
+					original = item
+				}
+			}
+			if original == nil {
+				t.Fatalf("seed record missing after rejected retry: %v", items)
+			}
+			if !reflect.DeepEqual(original, seedRecord) {
+				t.Fatalf("record changed after rejected retry:\n got %v\nwant %v", original, seedRecord)
+			}
+		})
+	}
+}
+
+// When every occurrence of a repeated member name is a string the request stays
+// valid: the last occurrence after JSON key unescaping wins, and only the final
+// key/value object is presented in the response and in queries. Special legal
+// strings (empty, whitespace, Chinese, the literal "null") keep working when
+// repeated.
+func TestPostNetPolicyDuplicateMembersAllStringsLastWins(t *testing.T) {
+	cases := []struct {
+		name       string
+		identity   string
+		paramsJSON string
+		want       map[string]any
+	}{
+		{"literal duplicate last wins", "dup-literal",
+			`{"mode": "audit", "mode": "enforce"}`, map[string]any{"mode": "enforce"}},
+		{"escaped duplicate last wins", "dup-escaped",
+			`{"\u006dode": "audit", "mode": "enforce"}`, map[string]any{"mode": "enforce"}},
+		{"escaped first then literal", "dup-escaped-first",
+			`{"\u006dode": "enforce", "mode": "audit"}`, map[string]any{"mode": "audit"}},
+		{"duplicates separated by other members", "dup-separated",
+			`{"a": "1", "mode": "audit", "b": "2", "mode": "enforce"}`,
+			map[string]any{"a": "1", "b": "2", "mode": "enforce"}},
+		{"empty string then non-empty", "dup-empty-first",
+			`{"mode": "", "mode": "enforce"}`, map[string]any{"mode": "enforce"}},
+		{"non-empty then empty string", "dup-empty-last",
+			`{"mode": "enforce", "mode": ""}`, map[string]any{"mode": ""}},
+		{"whitespace, chinese and literal null repeated", "dup-special",
+			`{"mode": "null", "\u006dode": " 拦截 "}`, map[string]any{"mode": " 拦截 "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := newTestRouter(t)
+			body := policyBody("payments", tc.identity, "tier=backend", tc.paramsJSON)
+			created := doRequest(router, http.MethodPost, "/v1/net-policies", body)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want %d: %s", created.Code, http.StatusCreated, created.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(created.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !reflect.DeepEqual(resp["pluginParams"], tc.want) {
+				t.Fatalf("response pluginParams = %v, want %v", resp["pluginParams"], tc.want)
+			}
+
+			items := listItems(t, router, "/v1/net-policies?namespace=payments")
+			if len(items) != 1 || !reflect.DeepEqual(items[0]["pluginParams"], tc.want) {
+				t.Fatalf("stored pluginParams = %v, want %v", items, tc.want)
+			}
+		})
+	}
+}
+
+// A retry of an identity created from duplicate member names returns 200 with
+// the original record when the final content matches, regardless of how the
+// members are spelled, consumes no order, and the following fresh identity
+// takes the next sequence value.
+func TestPostNetPolicyDuplicateMembersIdempotentRetryAndOrder(t *testing.T) {
+	router, _ := newTestRouter(t)
+	seed := policyBody("payments", "default-deny", "tier=backend",
+		`{"a": "1", "mode": "audit", "mode": "enforce"}`)
+	if rec := doRequest(router, http.MethodPost, "/v1/net-policies", seed); rec.Code != http.StatusCreated {
+		t.Fatalf("seed status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Same final content, single occurrence this time.
+	retry := doRequest(router, http.MethodPost, "/v1/net-policies",
+		policyBody("payments", "default-deny", "tier=backend", `{"mode": "enforce", "a": "1"}`))
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d: %s", retry.Code, http.StatusOK, retry.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(retry.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode retry: %v", err)
+	}
+	if body["order"] != float64(1) {
+		t.Fatalf("retry order = %v, want original 1", body["order"])
+	}
+	wantParams := map[string]any{"a": "1", "mode": "enforce"}
+	if !reflect.DeepEqual(body["pluginParams"], wantParams) {
+		t.Fatalf("retry pluginParams = %v, want %v", body["pluginParams"], wantParams)
+	}
+
+	// Different final content is still a conflict rather than an overwrite.
+	conflict := doRequest(router, http.MethodPost, "/v1/net-policies",
+		policyBody("payments", "default-deny", "tier=backend",
+			`{"mode": "audit", "mode": "audit"}`))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("changed retry status = %d, want %d: %s", conflict.Code, http.StatusConflict, conflict.Body.String())
+	}
+	assertErrorCode(t, conflict, "NetPolicyConflictError")
+
+	next := doRequest(router, http.MethodPost, "/v1/net-policies",
+		policyBody("payments", "after", "tier=backend",
+			`{"mode": "x", "mode": "x"}`))
+	if next.Code != http.StatusCreated {
+		t.Fatalf("next status = %d, want %d: %s", next.Code, http.StatusCreated, next.Body.String())
+	}
+	json.Unmarshal(next.Body.Bytes(), &body)
+	if body["order"] != float64(2) {
+		t.Fatalf("next order = %v, want 2", body["order"])
+	}
+	if !reflect.DeepEqual(body["pluginParams"], map[string]any{"mode": "x"}) {
+		t.Fatalf("next pluginParams = %v, want single final key", body["pluginParams"])
+	}
+
+	items := listItems(t, router, "/v1/net-policies?namespace=payments")
+	if len(items) != 2 {
+		t.Fatalf("items = %v, want 2 records", items)
+	}
+}
+
 func assertErrorCode(t *testing.T, recorder *httptest.ResponseRecorder, want string) {
 	t.Helper()
 	var body map[string]map[string]string
