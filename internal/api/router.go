@@ -8,8 +8,8 @@ import (
 	"github.com/Bob-xisuke/orb-netpolicy-guard/internal/store"
 )
 
-// NewRouter wires the public HTTP surface. Only the health entry is published today; the service
-// contract in README.md describes the error shape every entry must keep.
+// NewRouter wires the public HTTP surface. Every entry keeps the error shape
+// the service contract in README.md describes.
 func NewRouter(st *store.Store) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
@@ -17,10 +17,17 @@ func NewRouter(st *store.Store) *gin.Engine {
 
 	router.GET("/healthz", func(c *gin.Context) {
 		if err := st.Ping(); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "storage_unavailable", "message": "database is not available"}})
+			writeStorageUnavailable(c)
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "database": "ok"})
+	})
+
+	router.POST("/v1/net-policies", func(c *gin.Context) {
+		postNetPolicies(st, c)
+	})
+	router.GET("/v1/net-policies", func(c *gin.Context) {
+		getNetPolicies(st, c)
 	})
 
 	router.NoRoute(func(c *gin.Context) {
