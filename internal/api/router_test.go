@@ -598,3 +598,439 @@ func assertErrorCode(t *testing.T, recorder *httptest.ResponseRecorder, want str
 		t.Fatalf("error.message is empty (body %s)", recorder.Body.String())
 	}
 }
+
+// policyWithRules builds a registration body with explicit rules and
+// pluginParams JSON fragments.
+func policyWithRules(ns, name, label, rulesJSON, paramsJSON string) string {
+	return fmt.Sprintf(`{
+		"namespace": %q,
+		"name": %q,
+		"label": %q,
+		"rules": %s,
+		"pluginParams": %s
+	}`, ns, name, label, rulesJSON, paramsJSON)
+}
+
+// registerPolicy posts the body, requires a 201 and returns the decoded record.
+func registerPolicy(t *testing.T, router *gin.Engine, body string) map[string]any {
+	t.Helper()
+	recorder := doRequest(router, http.MethodPost, "/v1/net-policies", body)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("register status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
+		t.Fatalf("decode record: %v", err)
+	}
+	return record
+}
+
+// assertErrorShape verifies the published error contract: a single top-level
+// error object holding exactly the string fields code and message, with the
+// message free of SQL, stack traces and file paths.
+func assertErrorShape(t *testing.T, recorder *httptest.ResponseRecorder, wantCode string) {
+	t.Helper()
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("error body has %d top-level keys, want only \"error\": %s", len(body), recorder.Body.String())
+	}
+	raw, ok := body["error"]
+	if !ok {
+		t.Fatalf("error body missing \"error\": %s", recorder.Body.String())
+	}
+	var errObj map[string]any
+	if err := json.Unmarshal(raw, &errObj); err != nil {
+		t.Fatalf("error is not an object: %v", err)
+	}
+	if len(errObj) != 2 {
+		t.Fatalf("error fields = %v, want exactly code and message", errObj)
+	}
+	code, ok := errObj["code"].(string)
+	if !ok || code != wantCode {
+		t.Fatalf("error.code = %v, want %q (body %s)", errObj["code"], wantCode, recorder.Body.String())
+	}
+	message, ok := errObj["message"].(string)
+	if !ok || message == "" {
+		t.Fatalf("error.message = %v, want a non-empty string", errObj["message"])
+	}
+	lower := strings.ToLower(message)
+	for _, leak := range []string{"sql", "sqlite", "goroutine", ".go:", "panic", "/", "\\"} {
+		if strings.Contains(lower, leak) {
+			t.Fatalf("error.message leaks %q: %s", leak, message)
+		}
+	}
+}
+
+// The conflict flag is fixed at registration time: the first record keeps
+// conflict=false, a later opposite-action record with touching port intervals
+// is flagged true, and every query angle returns exactly what registration
+// returned, sorted by global order.
+func TestConflictFlagLifecycleAcrossRegisterAndQuery(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	first := registerPolicy(t, router, policyWithRules("payments", "alpha", "tier=backend",
+		`[{"direction": "ingress", "action": "deny", "ports": [100, 200]}]`,
+		`{"mode": "enforce"}`))
+	wantFirst := map[string]any{
+		"namespace": "payments",
+		"name":      "alpha",
+		"label":     "tier=backend",
+		"rules": []any{map[string]any{
+			"direction": "ingress", "action": "deny", "ports": []any{float64(100), float64(200)},
+		}},
+		"pluginParams": map[string]any{"mode": "enforce"},
+		"order":        float64(1),
+		"conflict":     false,
+	}
+	if !reflect.DeepEqual(first, wantFirst) {
+		t.Fatalf("first record = %v, want %v", first, wantFirst)
+	}
+
+	// Same namespace, label and direction, opposite action; the intervals
+	// touch at port 200, which counts as overlap.
+	second := registerPolicy(t, router, policyWithRules("payments", "beta", "tier=backend",
+		`[{"direction": "ingress", "action": "allow", "ports": [200, 300]}]`,
+		`{"mode": "audit"}`))
+	if second["order"] != float64(2) {
+		t.Fatalf("second order = %v, want 2", second["order"])
+	}
+	if second["conflict"] != true {
+		t.Fatalf("second conflict = %v, want true", second["conflict"])
+	}
+
+	// Namespace, label and intersection queries all return both records in
+	// global order, identical to the registration responses.
+	for _, target := range []string{
+		"/v1/net-policies?namespace=payments",
+		"/v1/net-policies?label=tier%3Dbackend",
+		"/v1/net-policies?namespace=payments&label=tier%3Dbackend",
+	} {
+		items := listItems(t, router, target)
+		if len(items) != 2 {
+			t.Fatalf("GET %s items = %v, want 2 entries", target, items)
+		}
+		if !reflect.DeepEqual(items[0], first) {
+			t.Fatalf("GET %s first item = %v, want registration response %v", target, items[0], first)
+		}
+		if !reflect.DeepEqual(items[1], second) {
+			t.Fatalf("GET %s second item = %v, want registration response %v", target, items[1], second)
+		}
+	}
+}
+
+// Overlap is decided on closed intervals: touching endpoints count, a single
+// port is an interval of one, and 1..65535 overlaps everything. Adjacent but
+// separated intervals do not overlap. The older record keeps its flag either
+// way.
+func TestConflictFlagPortBoundaries(t *testing.T) {
+	cases := []struct {
+		name      string
+		seedPorts [2]int
+		newPorts  [2]int
+		conflict  bool
+	}{
+		{"single port equal", [2]int{80, 80}, [2]int{80, 80}, true},
+		{"touching lower endpoint", [2]int{100, 200}, [2]int{200, 300}, true},
+		{"touching upper endpoint", [2]int{200, 300}, [2]int{100, 200}, true},
+		{"adjacent but separated", [2]int{100, 200}, [2]int{201, 300}, false},
+		{"single ports apart", [2]int{80, 80}, [2]int{81, 81}, false},
+		{"full range against port 1", [2]int{1, 65535}, [2]int{1, 1}, true},
+		{"full range against port 65535", [2]int{1, 65535}, [2]int{65535, 65535}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := newTestRouter(t)
+			seed := registerPolicy(t, router, policyWithRules("payments", "seed", "tier=backend",
+				fmt.Sprintf(`[{"direction": "ingress", "action": "deny", "ports": [%d, %d]}]`, tc.seedPorts[0], tc.seedPorts[1]),
+				`{}`))
+			if seed["conflict"] != false || seed["order"] != float64(1) {
+				t.Fatalf("seed = %v, want order 1 and conflict false", seed)
+			}
+
+			candidate := registerPolicy(t, router, policyWithRules("payments", "candidate", "tier=backend",
+				fmt.Sprintf(`[{"direction": "ingress", "action": "allow", "ports": [%d, %d]}]`, tc.newPorts[0], tc.newPorts[1]),
+				`{}`))
+			if candidate["order"] != float64(2) {
+				t.Fatalf("candidate order = %v, want 2", candidate["order"])
+			}
+			if candidate["conflict"] != tc.conflict {
+				t.Fatalf("candidate conflict = %v, want %v", candidate["conflict"], tc.conflict)
+			}
+
+			items := listItems(t, router, "/v1/net-policies?namespace=payments")
+			if len(items) != 2 {
+				t.Fatalf("items = %v, want 2 entries", items)
+			}
+			if !reflect.DeepEqual(items[0], seed) {
+				t.Fatalf("seed record changed after candidate: got %v, want %v", items[0], seed)
+			}
+			if !reflect.DeepEqual(items[1], candidate) {
+				t.Fatalf("queried candidate = %v, want registration response %v", items[1], candidate)
+			}
+		})
+	}
+}
+
+// A clash is found even when the conflicting rule sits behind non-clashing
+// rules, in the new policy or in the stored one.
+func TestConflictDetectedBeyondFirstRule(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	seed := registerPolicy(t, router, policyWithRules("payments", "multi-seed", "tier=backend", `[
+		{"direction": "egress", "action": "deny", "ports": [53, 53]},
+		{"direction": "ingress", "action": "deny", "ports": [1000, 2000]}
+	]`, `{}`))
+	if seed["conflict"] != false {
+		t.Fatalf("seed conflict = %v, want false", seed["conflict"])
+	}
+
+	// Only the last rule clashes, and only with the seed's last rule.
+	candidate := registerPolicy(t, router, policyWithRules("payments", "multi-candidate", "tier=backend", `[
+		{"direction": "ingress", "action": "allow", "ports": [9000, 9100]},
+		{"direction": "egress", "action": "allow", "ports": [53, 53]},
+		{"direction": "ingress", "action": "allow", "ports": [1500, 1600]}
+	]`, `{}`))
+	if candidate["order"] != float64(2) {
+		t.Fatalf("candidate order = %v, want 2", candidate["order"])
+	}
+	if candidate["conflict"] != true {
+		t.Fatalf("candidate conflict = %v, want true (late rule must be found)", candidate["conflict"])
+	}
+
+	items := listItems(t, router, "/v1/net-policies?namespace=payments&label=tier%3Dbackend")
+	if len(items) != 2 || !reflect.DeepEqual(items[0], seed) || !reflect.DeepEqual(items[1], candidate) {
+		t.Fatalf("items = %v, want unchanged seed then flagged candidate", items)
+	}
+}
+
+// None of these dimensions relax the flag: separated ports, a different
+// direction, the same action, a different namespace or a different label all
+// leave the new record at conflict=false. Each scenario uses distinct policy
+// names.
+func TestConflictFlagNegativeCases(t *testing.T) {
+	cases := []struct {
+		name           string
+		seedNS         string
+		seedLabel      string
+		seedRules      string
+		candidateNS    string
+		candidateLabel string
+		candidateRules string
+	}{
+		{
+			name:           "ports fully separated",
+			seedNS:         "payments", seedLabel: "tier=backend",
+			seedRules:      `[{"direction": "ingress", "action": "deny", "ports": [100, 200]}]`,
+			candidateNS:    "payments", candidateLabel: "tier=backend",
+			candidateRules: `[{"direction": "ingress", "action": "allow", "ports": [300, 400]}]`,
+		},
+		{
+			name:           "different direction",
+			seedNS:         "payments", seedLabel: "tier=backend",
+			seedRules:      `[{"direction": "ingress", "action": "deny", "ports": [1, 65535]}]`,
+			candidateNS:    "payments", candidateLabel: "tier=backend",
+			candidateRules: `[{"direction": "egress", "action": "allow", "ports": [80, 80]}]`,
+		},
+		{
+			name:           "same action",
+			seedNS:         "payments", seedLabel: "tier=backend",
+			seedRules:      `[{"direction": "ingress", "action": "deny", "ports": [1, 65535]}]`,
+			candidateNS:    "payments", candidateLabel: "tier=backend",
+			candidateRules: `[{"direction": "ingress", "action": "deny", "ports": [80, 80]}]`,
+		},
+		{
+			name:           "different namespace",
+			seedNS:         "payments", seedLabel: "tier=backend",
+			seedRules:      `[{"direction": "ingress", "action": "deny", "ports": [1, 65535]}]`,
+			candidateNS:    "staging", candidateLabel: "tier=backend",
+			candidateRules: `[{"direction": "ingress", "action": "allow", "ports": [80, 80]}]`,
+		},
+		{
+			name:           "different label",
+			seedNS:         "payments", seedLabel: "tier=backend",
+			seedRules:      `[{"direction": "ingress", "action": "deny", "ports": [1, 65535]}]`,
+			candidateNS:    "payments", candidateLabel: "tier=frontend",
+			candidateRules: `[{"direction": "ingress", "action": "allow", "ports": [80, 80]}]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := newTestRouter(t)
+			seed := registerPolicy(t, router, policyWithRules(tc.seedNS, "seed", tc.seedLabel, tc.seedRules, `{}`))
+			if seed["order"] != float64(1) || seed["conflict"] != false {
+				t.Fatalf("seed = %v, want order 1 and conflict false", seed)
+			}
+			candidate := registerPolicy(t, router, policyWithRules(tc.candidateNS, "candidate", tc.candidateLabel, tc.candidateRules, `{}`))
+			if candidate["order"] != float64(2) {
+				t.Fatalf("candidate order = %v, want 2", candidate["order"])
+			}
+			if candidate["conflict"] != false {
+				t.Fatalf("candidate conflict = %v, want false", candidate["conflict"])
+			}
+
+			// Records queried back through a namespace+label intersection match
+			// the registration responses exactly, in global order.
+			sharedIdentity := tc.seedNS == tc.candidateNS && tc.seedLabel == tc.candidateLabel
+			for _, want := range []map[string]any{seed, candidate} {
+				target := fmt.Sprintf("/v1/net-policies?namespace=%s&label=%s",
+					want["namespace"], strings.ReplaceAll(want["label"].(string), "=", "%3D"))
+				items := listItems(t, router, target)
+				expected := []map[string]any{want}
+				if sharedIdentity {
+					expected = []map[string]any{seed, candidate}
+				}
+				if !reflect.DeepEqual(items, expected) {
+					t.Fatalf("GET %s items = %v, want %v", target, items, expected)
+				}
+			}
+		})
+	}
+}
+
+// Records carrying true and false flags survive closing and reopening the same
+// database file with every field and the global order intact. Re-submitting
+// the original policy afterwards returns 200 with the original record: the
+// stored flag is served as-is, never recomputed against the newer
+// opposite-action record, and pluginParams member order is irrelevant.
+func TestConflictFlagsSurviveReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	router := NewRouter(st)
+
+	first := registerPolicy(t, router, policyWithRules("payments", "alpha", "tier=backend",
+		`[{"direction": "ingress", "action": "deny", "ports": [80, 80]}]`,
+		`{"mode": "enforce", "zone": "north"}`))
+	if first["conflict"] != false || first["order"] != float64(1) {
+		t.Fatalf("first = %v, want order 1 and conflict false", first)
+	}
+	second := registerPolicy(t, router, policyWithRules("payments", "beta", "tier=backend",
+		`[{"direction": "ingress", "action": "allow", "ports": [80, 80]}]`,
+		`{"mode": "audit"}`))
+	if second["conflict"] != true || second["order"] != float64(2) {
+		t.Fatalf("second = %v, want order 2 and conflict true", second)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	router = NewRouter(reopened)
+
+	items := listItems(t, router, "/v1/net-policies?namespace=payments")
+	if len(items) != 2 {
+		t.Fatalf("items after reopen = %v, want 2 entries", items)
+	}
+	if !reflect.DeepEqual(items[0], first) {
+		t.Fatalf("first record after reopen = %v, want %v", items[0], first)
+	}
+	if !reflect.DeepEqual(items[1], second) {
+		t.Fatalf("second record after reopen = %v, want %v", items[1], second)
+	}
+
+	// Same content, pluginParams members in a different order: still the
+	// original record, still conflict=false, still 200.
+	retry := doRequest(router, http.MethodPost, "/v1/net-policies", policyWithRules("payments", "alpha", "tier=backend",
+		`[{"direction": "ingress", "action": "deny", "ports": [80, 80]}]`,
+		`{"zone": "north", "mode": "enforce"}`))
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d: %s", retry.Code, http.StatusOK, retry.Body.String())
+	}
+	var retryRecord map[string]any
+	if err := json.Unmarshal(retry.Body.Bytes(), &retryRecord); err != nil {
+		t.Fatalf("decode retry: %v", err)
+	}
+	if !reflect.DeepEqual(retryRecord, first) {
+		t.Fatalf("retry record = %v, want original %v (flags must not be recomputed)", retryRecord, first)
+	}
+
+	// The retry consumed no order: the next new identity takes max order + 1.
+	third := registerPolicy(t, router, policyWithRules("payments", "gamma", "tier=backend",
+		`[{"direction": "egress", "action": "allow", "ports": [53, 53]}]`, `{}`))
+	if third["order"] != float64(3) {
+		t.Fatalf("order after reopen and retry = %v, want 3", third["order"])
+	}
+}
+
+// Rejected requests (400/409) and same-content retries never add records,
+// never change stored fields and never consume an order value; the next legal
+// policy takes the current maximum order plus one.
+func TestRejectedAndRetriedRequestsLeaveRegistryUntouched(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	seedBody := policyWithRules("payments", "alpha", "tier=backend",
+		`[{"direction": "ingress", "action": "deny", "ports": [1, 65535]}]`,
+		`{"mode": "enforce"}`)
+	seed := registerPolicy(t, router, seedBody)
+
+	// Same-content retry: 200 with the original record, nothing changes.
+	retry := doRequest(router, http.MethodPost, "/v1/net-policies", seedBody)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want %d: %s", retry.Code, http.StatusOK, retry.Body.String())
+	}
+	var retryRecord map[string]any
+	if err := json.Unmarshal(retry.Body.Bytes(), &retryRecord); err != nil {
+		t.Fatalf("decode retry: %v", err)
+	}
+	if !reflect.DeepEqual(retryRecord, seed) {
+		t.Fatalf("retry record = %v, want original %v", retryRecord, seed)
+	}
+
+	// A legal change to an existing identity's plugin string value: 409.
+	changed := doRequest(router, http.MethodPost, "/v1/net-policies",
+		policyWithRules("payments", "alpha", "tier=backend",
+			`[{"direction": "ingress", "action": "deny", "ports": [1, 65535]}]`,
+			`{"mode": "audit"}`))
+	if changed.Code != http.StatusConflict {
+		t.Fatalf("changed status = %d, want %d: %s", changed.Code, http.StatusConflict, changed.Body.String())
+	}
+	assertErrorShape(t, changed, "NetPolicyConflictError")
+
+	// Invalid direction and out-of-range ports: 400.
+	for name, body := range map[string]string{
+		"bad direction": policyWithRules("payments", "beta", "tier=backend",
+			`[{"direction": "sideways", "action": "allow", "ports": [80, 80]}]`, `{}`),
+		"port below range": policyWithRules("payments", "gamma", "tier=backend",
+			`[{"direction": "ingress", "action": "allow", "ports": [0, 80]}]`, `{}`),
+		"port above range": policyWithRules("payments", "delta", "tier=backend",
+			`[{"direction": "ingress", "action": "allow", "ports": [1, 65536]}]`, `{}`),
+	} {
+		recorder := doRequest(router, http.MethodPost, "/v1/net-policies", body)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want %d: %s", name, recorder.Code, http.StatusBadRequest, recorder.Body.String())
+		}
+		assertErrorShape(t, recorder, "InvalidNetPolicyInputError")
+	}
+
+	// A filter matching nothing: 404.
+	miss := doRequest(router, http.MethodGet, "/v1/net-policies?namespace=staging", "")
+	if miss.Code != http.StatusNotFound {
+		t.Fatalf("miss status = %d, want %d: %s", miss.Code, http.StatusNotFound, miss.Body.String())
+	}
+	assertErrorShape(t, miss, "NetPolicyNotFoundError")
+
+	// Nothing was added and the committed record is untouched in every field.
+	items := listItems(t, router, "/v1/net-policies?namespace=payments")
+	if len(items) != 1 {
+		t.Fatalf("items = %v, want the single original record", items)
+	}
+	if !reflect.DeepEqual(items[0], seed) {
+		t.Fatalf("record changed after rejected requests: got %v, want %v", items[0], seed)
+	}
+
+	// The next legal new policy takes the current maximum order plus one.
+	next := registerPolicy(t, router, policyWithRules("payments", "epsilon", "tier=backend",
+		`[{"direction": "egress", "action": "allow", "ports": [53, 53]}]`, `{}`))
+	if next["order"] != float64(2) {
+		t.Fatalf("next order = %v, want 2 (rejections and retries consume no order)", next["order"])
+	}
+}
