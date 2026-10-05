@@ -133,12 +133,62 @@ func parseNetPolicyQuery(rawQuery string) (namespace, label string, ok bool) {
 	return namespace, label, true
 }
 
-// decodeNetPolicy strictly validates the request body: a single JSON object with
-// the required fields, enums, and port intervals from the service contract.
+// decodeNetPolicy strictly validates the request body: a single JSON object
+// with the required fields, enums, and port intervals from the service contract.
+//
+// The top-level object is walked with a streaming decoder instead of a plain
+// map decode so every occurrence of pluginParams is validated on its own: a
+// later object must not overwrite an earlier illegal one before that earlier
+// object is checked, so {"mode":null} followed by {"mode":"enforce"} fails.
+// Field names match after JSON unescaping, making "pluginParams" and
+// "\u0070luginParams" the same field. When every occurrence is legal the last
+// complete object wins. Other fields keep their existing single-value
+// parsing behaviour (a repeated name keeps its last value).
 func decodeNetPolicy(body io.Reader) (store.Record, bool) {
-	var raw map[string]json.RawMessage
 	decoder := json.NewDecoder(body)
-	if err := decoder.Decode(&raw); err != nil {
+	opening, err := decoder.Token()
+	if err != nil {
+		return store.Record{}, false
+	}
+	if delim, ok := opening.(json.Delim); !ok || delim != '{' {
+		// Rejects empty input, null, scalars and arrays outright.
+		return store.Record{}, false
+	}
+
+	raw := map[string]json.RawMessage{}
+	var (
+		pluginParams    map[string]string
+		pluginParamsSet bool
+	)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return store.Record{}, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return store.Record{}, false
+		}
+		var blob json.RawMessage
+		if err := decoder.Decode(&blob); err != nil {
+			return store.Record{}, false
+		}
+		if key == "pluginParams" {
+			// Validate each occurrence immediately: an illegal object must be
+			// rejected even when a later legal object would overwrite it.
+			params, valid := decodePluginObject(blob)
+			if !valid {
+				return store.Record{}, false
+			}
+			pluginParams, pluginParamsSet = params, true
+		}
+		raw[key] = blob
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return store.Record{}, false
+	}
+	if delim, ok := closing.(json.Delim); !ok || delim != '}' {
 		return store.Record{}, false
 	}
 	var trailing any
@@ -160,9 +210,10 @@ func decodeNetPolicy(body io.Reader) (store.Record, bool) {
 	if rec.Rules, ok = decodeRules(raw); !ok {
 		return store.Record{}, false
 	}
-	if rec.PluginParams, ok = decodePluginParams(raw); !ok {
+	if !pluginParamsSet {
 		return store.Record{}, false
 	}
+	rec.PluginParams = pluginParams
 	return rec, true
 }
 
@@ -239,22 +290,17 @@ func requiredEnum(raw map[string]json.RawMessage, key string, allowed ...string)
 	return "", false
 }
 
-// decodePluginParams validates and decodes the pluginParams object. The published
-// contract is a string-to-string object: null, numbers, booleans, arrays and
-// nested objects are invalid input rather than coerced or dropped.
+// decodePluginObject validates and decodes one pluginParams value. The
+// published contract is a string-to-string object: null, numbers, booleans,
+// arrays and nested objects are invalid input rather than coerced or dropped.
 //
 // Members are walked with a streaming decoder so every occurrence of a repeated
 // member name is inspected, not just the value a map decode would keep last.
 // {"mode":null,"mode":"enforce"} must fail on the null even though a legal
 // string follows it; keys are matched after JSON unescaping, so "mode" and
-// "mode" are the same member. When every occurrence is a string the last
-// value for each decoded key wins. Only a top-level object appearing once is
-// accepted here; other fields keep their existing parsing behaviour.
-func decodePluginParams(raw map[string]json.RawMessage) (map[string]string, bool) {
-	blob, present := raw["pluginParams"]
-	if !present {
-		return nil, false
-	}
+// "\u006dode" are the same member. When every occurrence is a string the last
+// value for each decoded key wins, and the empty object yields an empty map.
+func decodePluginObject(blob json.RawMessage) (map[string]string, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(blob))
 	opening, err := decoder.Token()
 	if err != nil {
