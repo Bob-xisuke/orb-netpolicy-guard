@@ -136,8 +136,12 @@ func parseNetPolicyQuery(rawQuery string) (namespace, label string, ok bool) {
 // decodeNetPolicy strictly validates the request body: a single JSON object with
 // the required fields, enums, and port intervals from the service contract.
 func decodeNetPolicy(body io.Reader) (store.Record, bool) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return store.Record{}, false
+	}
 	var raw map[string]json.RawMessage
-	decoder := json.NewDecoder(body)
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(&raw); err != nil {
 		return store.Record{}, false
 	}
@@ -160,7 +164,7 @@ func decodeNetPolicy(body io.Reader) (store.Record, bool) {
 	if rec.Rules, ok = decodeRules(raw); !ok {
 		return store.Record{}, false
 	}
-	if rec.PluginParams, ok = decodePluginParams(raw); !ok {
+	if rec.PluginParams, ok = decodePluginParams(data); !ok {
 		return store.Record{}, false
 	}
 	return rec, true
@@ -239,22 +243,72 @@ func requiredEnum(raw map[string]json.RawMessage, key string, allowed ...string)
 	return "", false
 }
 
-// decodePluginParams validates and decodes the pluginParams object. The published
+// decodePluginParams validates and decodes the pluginParams field. The published
 // contract is a string-to-string object: null, numbers, booleans, arrays and
 // nested objects are invalid input rather than coerced or dropped.
 //
-// Members are walked with a streaming decoder so every occurrence of a repeated
-// member name is inspected, not just the value a map decode would keep last.
-// {"mode":null,"mode":"enforce"} must fail on the null even though a legal
-// string follows it; keys are matched after JSON unescaping, so "mode" and
-// "mode" are the same member. When every occurrence is a string the last
-// value for each decoded key wins. Only a top-level object appearing once is
-// accepted here; other fields keep their existing parsing behaviour.
-func decodePluginParams(raw map[string]json.RawMessage) (map[string]string, bool) {
-	blob, present := raw["pluginParams"]
+// The top-level object is walked with a streaming decoder so every occurrence
+// of a repeated pluginParams field is inspected, not just the one a map decode
+// would keep last. {"pluginParams":{"mode":null},"pluginParams":{"mode":"enforce"}}
+// must fail on the null even though a legal object follows it; field names are
+// matched after JSON unescaping, so a name written with a unicode escape on its
+// first letter is the same field as the literal spelling. When every occurrence is a legal object the last complete object
+// wins as a whole — earlier objects are not merged in — and a trailing empty
+// object registers as an empty object. Other fields keep their existing
+// map-based parsing behaviour.
+func decodePluginParams(data []byte) (map[string]string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, false
+	}
+	delim, ok := opening.(json.Delim)
+	if !ok || delim != '{' {
+		return nil, false
+	}
+
+	var params map[string]string
+	present := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false
+		}
+		var blob json.RawMessage
+		if err := decoder.Decode(&blob); err != nil {
+			return nil, false
+		}
+		if key != "pluginParams" {
+			continue
+		}
+		occurrence, ok := decodePluginParamsObject(blob)
+		if !ok {
+			return nil, false
+		}
+		params = occurrence
+		present = true
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, false
+	}
 	if !present {
 		return nil, false
 	}
+	return params, true
+}
+
+// decodePluginParamsObject validates one pluginParams object. Members are
+// walked with a streaming decoder so every occurrence of a repeated member
+// name is inspected, not just the value a map decode would keep last.
+// {"mode":null,"mode":"enforce"} must fail on the null even though a legal
+// string follows it; keys are matched after JSON unescaping, so "mode" and
+// "mode" are the same member. When every occurrence is a string the last
+// value for each decoded key wins.
+func decodePluginParamsObject(blob json.RawMessage) (map[string]string, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(blob))
 	opening, err := decoder.Token()
 	if err != nil {
