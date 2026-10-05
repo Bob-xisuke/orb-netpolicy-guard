@@ -60,7 +60,7 @@ go run .
 
 ### `GET /v1/net-policies`
 
-查询已提交记录。`namespace` 与 `label` 至少提供一个，同时提供时取交集；缺少条件、空白或重复参数返回 400 与 `InvalidNetPolicyInputError`。命中返回 200：
+查询已提交记录。整条查询串先通过校验才返回记录：任一参数名或值含不完整或非十六进制的百分号转义，或任一查询片段含未转义分号，整次查询返回 400 与 `InvalidNetPolicyInputError`——即使坏片段属于未知参数、其余条件本可命中记录也不例外。参数只解码一次（`+` 表示空格，`%2B`、`%3B`、`%26` 分别是值中的加号、分号与 `&`），解码后的 `namespace` 与 `label` 至少提供一个；同名已知参数（按解码后判定，`namespace` 与 `%6Eamespace` 同名）重复出现、值为空或纯空白同样返回 400。合法的未知参数被忽略，空查询片段与末尾的 `&` 不影响结果。非空白值按解码后的原值精确匹配，不裁剪空格、不改变大小写；两个条件同时提供时取交集。命中返回 200：
 
 ```json
 {"items":[{"namespace":"payments","name":"default-deny","label":"tier=backend","rules":[...],"pluginParams":{...},"order":1,"conflict":false}]}

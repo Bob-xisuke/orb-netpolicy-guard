@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -59,19 +60,9 @@ func NewRouter(st *store.Store) *gin.Engine {
 	})
 
 	router.GET("/v1/net-policies", func(c *gin.Context) {
-		query := c.Request.URL.Query()
-		namespace, ok := singleQueryValue(query, "namespace")
+		namespace, label, ok := parseNetPolicyQuery(c.Request.URL.RawQuery)
 		if !ok {
-			writeError(c, http.StatusBadRequest, codeInvalidInput, "namespace must appear at most once and be non-blank")
-			return
-		}
-		label, ok := singleQueryValue(query, "label")
-		if !ok {
-			writeError(c, http.StatusBadRequest, codeInvalidInput, "label must appear at most once and be non-blank")
-			return
-		}
-		if namespace == "" && label == "" {
-			writeError(c, http.StatusBadRequest, codeInvalidInput, "namespace or label is required")
+			writeError(c, http.StatusBadRequest, codeInvalidInput, "query must be well-formed and carry a single non-blank namespace or label")
 			return
 		}
 		records, err := st.List(namespace, label)
@@ -96,17 +87,50 @@ func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
 }
 
-// singleQueryValue accepts a parameter that appears at most once with a non-blank
-// value. Absent yields ("", true); duplicated or blank yields ("", false).
-func singleQueryValue(query map[string][]string, key string) (string, bool) {
-	values, present := query[key]
-	if !present {
-		return "", true
+// parseNetPolicyQuery strictly parses the raw query string for the GET entry.
+// The whole query must validate before any record is returned: every segment
+// needs valid percent escapes in both name and value, and no segment may carry
+// an unescaped semicolon — a malformed fragment rejects the request even when
+// it belongs to an unknown parameter or the remaining conditions would have
+// matched committed records. Empty segments (including a trailing &) are
+// skipped. Names are compared after a single decode, so "namespace" and
+// "%6Eamespace" are the same parameter; a known parameter may appear at most
+// once with a non-blank value, and at least one of namespace/label must be
+// present. Legal unknown parameters are ignored. Values are decoded exactly
+// once (+ means space) and matched verbatim — no trimming or case folding.
+func parseNetPolicyQuery(rawQuery string) (namespace, label string, ok bool) {
+	seen := map[string]bool{}
+	values := map[string]string{}
+	for _, segment := range strings.Split(rawQuery, "&") {
+		if segment == "" {
+			continue
+		}
+		if strings.Contains(segment, ";") {
+			return "", "", false
+		}
+		name, value, _ := strings.Cut(segment, "=")
+		decodedName, err := url.QueryUnescape(name)
+		if err != nil {
+			return "", "", false
+		}
+		decodedValue, err := url.QueryUnescape(value)
+		if err != nil {
+			return "", "", false
+		}
+		if decodedName != "namespace" && decodedName != "label" {
+			continue
+		}
+		if seen[decodedName] || strings.TrimSpace(decodedValue) == "" {
+			return "", "", false
+		}
+		seen[decodedName] = true
+		values[decodedName] = decodedValue
 	}
-	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
-		return "", false
+	namespace, label = values["namespace"], values["label"]
+	if namespace == "" && label == "" {
+		return "", "", false
 	}
-	return values[0], true
+	return namespace, label, true
 }
 
 // decodeNetPolicy strictly validates the request body: a single JSON object with
