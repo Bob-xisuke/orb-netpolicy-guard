@@ -6,11 +6,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
 )
+
+// testFaultTrigger marks the BEFORE INSERT trigger that test builds install to
+// reject new rows. The trigger name is also quoted into the DDL, so it stays a
+// fixed identifier rather than interpolated input.
+const testFaultTrigger = "net_policies_reject_new_rows_test"
+
+// TestingT is the subset of *testing.T the test-only fault hooks rely on. It
+// keeps the production package free of a testing import while letting test
+// builds surface injection setup failures immediately.
+type TestingT interface {
+	Helper()
+	Fatalf(format string, args ...any)
+}
 
 // ErrConflict reports that a net policy identity already holds different content.
 var ErrConflict = errors.New("net policy identity holds different content")
@@ -35,16 +49,22 @@ type Record struct {
 
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex
+	db   *sql.DB
+	mu   sync.Mutex
+	path string
+	down bool
 }
 
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
+	// Keep the connection pool at size one: BEGIN opens a transaction on one
+	// pooled connection and COMMIT must land on that same connection. A single
+	// connection also makes the test-only fault triggers below deterministic.
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable wal: %w", err)
@@ -53,7 +73,7 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, path: filepath.Clean(path)}, nil
 }
 
 // Ping reports whether the storage layer is usable.
@@ -61,6 +81,61 @@ func (s *Store) Ping() error { return s.db.Ping() }
 
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
+
+// SetWritesFailForTesting installs (or, with fail=false, removes) a BEFORE
+// INSERT trigger that rejects every new net_policies row at the storage layer.
+// Reads, commits already on disk and idempotent same-content lookups all keep
+// working while the trigger is installed, so callers observe a store that
+// "can still read but refuses new records". It is intended solely for failure
+// injection in tests.
+func (s *Store) SetWritesFailForTesting(t TestingT, fail bool) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fail {
+		if _, err := s.db.Exec(fmt.Sprintf(
+			`CREATE TRIGGER IF NOT EXISTS %s BEFORE INSERT ON net_policies
+			 BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END`,
+			testFaultTrigger)); err != nil {
+			t.Fatalf("install write-failure trigger: %v", err)
+		}
+		return
+	}
+	if _, err := s.db.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s`, testFaultTrigger)); err != nil {
+		t.Fatalf("remove write-failure trigger: %v", err)
+	}
+}
+
+// SetStorageDownForTesting tears down the live database handle (fail=true), so
+// Ping, reads and writes all fail, or reopens the same database file
+// (fail=false) with every committed record intact. It is intended solely for
+// failure injection in tests.
+func (s *Store) SetStorageDownForTesting(t TestingT, down bool) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if down == s.down {
+		return
+	}
+	if down {
+		if err := s.db.Close(); err != nil {
+			t.Fatalf("close database to simulate outage: %v", err)
+		}
+		s.down = true
+		return
+	}
+	db, err := sql.Open("sqlite", s.path)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		t.Fatalf("reopened database is not usable: %v", err)
+	}
+	s.db = db
+	s.down = false
+}
 
 // Register commits a new net policy. Retrying an identity with identical content
 // returns the stored record with created=false; different content yields ErrConflict.
