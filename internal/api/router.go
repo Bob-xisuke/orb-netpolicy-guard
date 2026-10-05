@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -59,22 +60,12 @@ func NewRouter(st *store.Store) *gin.Engine {
 	})
 
 	router.GET("/v1/net-policies", func(c *gin.Context) {
-		query := c.Request.URL.Query()
-		namespace, ok := singleQueryValue(query, "namespace")
-		if !ok {
-			writeError(c, http.StatusBadRequest, codeInvalidInput, "namespace must appear at most once and be non-blank")
+		filters, err := parseNetPolicyQuery(c.Request.URL.RawQuery)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, codeInvalidInput, "query parameters are not valid")
 			return
 		}
-		label, ok := singleQueryValue(query, "label")
-		if !ok {
-			writeError(c, http.StatusBadRequest, codeInvalidInput, "label must appear at most once and be non-blank")
-			return
-		}
-		if namespace == "" && label == "" {
-			writeError(c, http.StatusBadRequest, codeInvalidInput, "namespace or label is required")
-			return
-		}
-		records, err := st.List(namespace, label)
+		records, err := st.List(filters.namespace, filters.label)
 		if err != nil {
 			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")
 			return
@@ -96,18 +87,70 @@ func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
 }
 
-// singleQueryValue accepts a parameter that appears at most once with a non-blank
-// value. Absent yields ("", true); duplicated or blank yields ("", false).
-func singleQueryValue(query map[string][]string, key string) (string, bool) {
-	values, present := query[key]
-	if !present {
-		return "", true
-	}
-	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
-		return "", false
-	}
-	return values[0], true
+// netPolicyQueryFilters are the decoded query conditions the list endpoint
+// accepts; an empty string means the condition was not supplied.
+type netPolicyQueryFilters struct {
+	namespace string
+	label     string
 }
+
+// parseNetPolicyQuery validates the whole raw query before any record is read.
+//
+// Every fragment must decode cleanly: an incomplete or non-hex percent escape,
+// or a literal (unescaped) semicolon in any fragment — including fragments for
+// unknown parameters — invalidates the entire request rather than being
+// dropped. Validation precedes storage access, so an invalid query never
+// returns the records its surviving fragments would match.
+//
+// Once decoding succeeds, unknown parameters are ignored. The known parameters
+// namespace and label must each appear at most once under their decoded name
+// (namespace and %6Eamespace are the same parameter), must not be empty or
+// whitespace-only, and at least one of the two must be present. Decoding
+// happens exactly once and values are matched verbatim afterwards: "+" is a
+// space while %2B, %3B and %26 arrive as literal "+", ";" and "&", with no
+// trimming or case folding. Empty fragments and a trailing "&" carry no
+// meaning and stay legal.
+func parseNetPolicyQuery(rawQuery string) (netPolicyQueryFilters, error) {
+	var filters netPolicyQueryFilters
+	if rawQuery == "" {
+		return filters, errInvalidQuery
+	}
+
+	// ParseQuery surfaces malformed escapes and literal semicolons as an error
+	// even though it also returns the fragments decoded so far; the partial
+	// result must never be used to answer the request.
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return netPolicyQueryFilters{}, errInvalidQuery
+	}
+
+	for key, decoded := range values {
+		switch key {
+		case "namespace", "label":
+			// Identical repeated values are still a repeat, and an empty value
+			// shows up as an empty-string entry, so both cases fail here.
+			if len(decoded) != 1 || strings.TrimSpace(decoded[0]) == "" {
+				return netPolicyQueryFilters{}, errInvalidQuery
+			}
+		default:
+			// Unknown parameters are accepted after decoding, their values
+			// (including empty ones) ignored.
+			continue
+		}
+		if key == "namespace" {
+			filters.namespace = decoded[0]
+		} else {
+			filters.label = decoded[0]
+		}
+	}
+
+	if filters.namespace == "" && filters.label == "" {
+		return netPolicyQueryFilters{}, errInvalidQuery
+	}
+	return filters, nil
+}
+
+var errInvalidQuery = errors.New("invalid net policy query")
 
 // decodeNetPolicy strictly validates the request body: a single JSON object with
 // the required fields, enums, and port intervals from the service contract.
