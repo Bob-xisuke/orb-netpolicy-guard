@@ -218,6 +218,152 @@ func TestCorruptedStoredRulesFailClosedUntilRestored(t *testing.T) {
 	}
 }
 
+// The conflict scan for a brand-new identity must read every committed record
+// in the candidate's namespace and label before deciding: when one record in
+// that scope holds undecodable rules, the registration fails with 503
+// storage_unavailable even though another intact record in the same scope
+// already determines the conflict flag by itself. The answer must not depend
+// on the order the historical records were registered in or on how their
+// names sort, and the failed attempts must leave no row, consume no order and
+// not touch the intact records. Restoring the broken rules verbatim lets the
+// same request commit with the next order and the conflict flag computed from
+// the restored history. The scenario runs under every combination of
+// registration order and name ordering of the two historical records.
+func TestConflictScanFailsClosedOnCorruptScopeRegardlessOfHistoryOrder(t *testing.T) {
+	cases := []struct {
+		name         string
+		corruptName  string // policy name of the record whose rules get broken
+		corruptFirst bool   // register the to-be-corrupted record before the intact one
+	}{
+		{"corrupt registered first, name sorts first", "aaa-dns", true},
+		{"corrupt registered first, name sorts last", "zzz-dns", true},
+		{"corrupt registered second, name sorts first", "aaa-dns", false},
+		{"corrupt registered second, name sorts last", "zzz-dns", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _, _, admin := newFaultRouter(t)
+
+			// Same namespace and label: an intact ingress deny [80,100] and an
+			// egress allow [53,53] whose stored rules are about to be broken.
+			denyBody := singleRuleBody("payments", "deny-web", "tier=backend",
+				"ingress", "deny", 80, 100, `{"mode": "enforce"}`)
+			egressBody := singleRuleBody("payments", tc.corruptName, "tier=backend",
+				"egress", "allow", 53, 53, `{}`)
+			var seeds []map[string]any
+			var deny map[string]any
+			if tc.corruptFirst {
+				seeds = append(seeds, registerCreated(t, router, egressBody, 1, false))
+				deny = registerCreated(t, router, denyBody, 2, false)
+				seeds = append(seeds, deny)
+			} else {
+				deny = registerCreated(t, router, denyBody, 1, false)
+				seeds = append(seeds, deny)
+				seeds = append(seeds, registerCreated(t, router, egressBody, 2, false))
+			}
+			stagingBody := singleRuleBody("staging", "batch", "tier=frontend", "egress", "allow", 53, 53, `{}`)
+			staging := registerCreated(t, router, stagingBody, 3, false)
+
+			// Break only the rules column of the egress record: syntactically
+			// incomplete JSON, connection and every other stored byte intact.
+			originalRules := corruptStoredColumn(t, admin, "payments", tc.corruptName, "rules",
+				`[{"direction": "egress", "action": "allow", "ports": [53,`)
+
+			// A brand-new identity in the same scope. The intact deny record
+			// alone already decides the rules conflict (ingress allow [100,200]
+			// meets ingress deny [80,100] at port 100), yet the undecodable
+			// record in the same scope must still fail the request closed:
+			// 503 storage_unavailable, and the repeat fails the same way.
+			candidateBody := singleRuleBody("payments", "allow-web", "tier=backend",
+				"ingress", "allow", 100, 200, `{"mode": "enforce"}`)
+			postExpect(t, router, candidateBody, http.StatusServiceUnavailable, "storage_unavailable")
+			postExpect(t, router, candidateBody, http.StatusServiceUnavailable, "storage_unavailable")
+
+			// The established error priorities hold while the scope is corrupt:
+			// input validation still runs before storage is touched.
+			postExpect(t, router,
+				singleRuleBody("payments", "bad-direction", "tier=backend", "sideways", "allow", 80, 80, `{}`),
+				http.StatusBadRequest, "InvalidNetPolicyInputError")
+			postExpect(t, router,
+				singleRuleBody("payments", "port-too-high", "tier=backend", "ingress", "allow", 1, 65536, `{}`),
+				http.StatusBadRequest, "InvalidNetPolicyInputError")
+
+			// Same identity as the corrupt record, different legal content: the
+			// intact content fingerprint still decides -> 409.
+			changedBody := singleRuleBody("payments", tc.corruptName, "tier=backend",
+				"egress", "allow", 53, 53, `{"mode": "audit"}`)
+			postExpect(t, router, changedBody, http.StatusConflict, "NetPolicyConflictError")
+
+			// Same-content retry of the intact record is read-only and stays
+			// 200 with the original record, unaffected by the corrupt record
+			// sharing its scope.
+			intactRetry := doRequest(router, http.MethodPost, "/v1/net-policies", denyBody)
+			if intactRetry.Code != http.StatusOK {
+				t.Fatalf("intact retry status = %d, want %d: %s", intactRetry.Code, http.StatusOK, intactRetry.Body.String())
+			}
+			if got := decodeRecord(t, intactRetry.Body.Bytes()); !reflect.DeepEqual(got, deny) {
+				t.Fatalf("intact retry record = %v, want the committed deny record %v", got, deny)
+			}
+
+			// Same-content retry of the corrupt identity itself cannot decode
+			// the stored record for the response -> 503.
+			postExpect(t, router, egressBody, http.StatusServiceUnavailable, "storage_unavailable")
+
+			// Queries that would have to decode the broken record fail closed
+			// with no partial items; filters excluding it still hit, a query
+			// matching nothing stays 404, and the healthy connection keeps the
+			// health check at 200.
+			for _, target := range []string{
+				"/v1/net-policies?namespace=payments",
+				"/v1/net-policies?label=tier%3Dbackend",
+				"/v1/net-policies?namespace=payments&label=tier%3Dbackend",
+			} {
+				getExpectError(t, router, target, http.StatusServiceUnavailable, "storage_unavailable")
+			}
+			if items := listItems(t, router, "/v1/net-policies?namespace=staging"); !reflect.DeepEqual(items, []map[string]any{staging}) {
+				t.Fatalf("staging items = %v, want only %v", items, staging)
+			}
+			getExpectError(t, router, "/v1/net-policies?namespace=missing", http.StatusNotFound, "NetPolicyNotFoundError")
+			health := doRequest(router, http.MethodGet, "/healthz", "")
+			if health.Code != http.StatusOK || health.Body.String() != `{"database":"ok","status":"ok"}` {
+				t.Fatalf("healthz with corrupted record = %d %s, want 200 ok", health.Code, health.Body.String())
+			}
+
+			// Restore the stored rules verbatim: the historical records come
+			// back exactly as committed, proving the failed registrations
+			// changed none of their fields or conflict flags.
+			restoreStoredColumn(t, admin, "payments", tc.corruptName, "rules", originalRules)
+
+			// The request that failed while the scope was corrupt now commits:
+			// order is the maximum committed order plus one — the failed
+			// attempts consumed nothing — and conflict is true because the
+			// restored history holds ingress deny [80,100].
+			candidate := registerCreated(t, router, candidateBody, 4, true)
+
+			// The identical retry is now an idempotent 200 with that record.
+			retry := doRequest(router, http.MethodPost, "/v1/net-policies", candidateBody)
+			if retry.Code != http.StatusOK {
+				t.Fatalf("retry after restore status = %d, want %d: %s", retry.Code, http.StatusOK, retry.Body.String())
+			}
+			if got := decodeRecord(t, retry.Body.Bytes()); !reflect.DeepEqual(got, candidate) {
+				t.Fatalf("retry after restore record = %v, want %v", got, candidate)
+			}
+
+			// A further legal new identity continues the order sequence.
+			nextBody := singleRuleBody("payments", "after-recovery", "tier=backend",
+				"egress", "allow", 8053, 8053, `{}`)
+			next := registerCreated(t, router, nextBody, 5, false)
+
+			// The restored registry returns the complete record set sorted by
+			// order ascending, every historical field and conflict flag intact.
+			wantAll := append(append([]map[string]any{}, seeds...), candidate, next)
+			if items := listItems(t, router, "/v1/net-policies?namespace=payments"); !reflect.DeepEqual(items, wantAll) {
+				t.Fatalf("items after recovery = %v, want %v", items, wantAll)
+			}
+		})
+	}
+}
+
 // A committed record whose stored pluginParams no longer decode takes down
 // every query and same-identity identical-content write that would have to
 // read it, while the intact content fingerprint still answers 409 for
