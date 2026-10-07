@@ -193,6 +193,11 @@ func (s *Store) List(namespace, label string) ([]Record, error) {
 // detectConflict reports whether the candidate record clashes with any committed
 // record sharing its namespace and label: same direction, opposite action, and
 // overlapping port intervals.
+//
+// Every row in scope is decoded before the answer is returned: a clash decided
+// by one record must not skip another record whose stored rules no longer
+// parse, otherwise the outcome would depend on the order the history rows
+// happen to be read in. Any undecodable record in scope fails the whole scan.
 func detectConflict(tx *sql.Tx, rec Record) (bool, error) {
 	rows, err := tx.Query(
 		`SELECT rules FROM net_policies WHERE namespace = ? AND label = ?`,
@@ -202,6 +207,7 @@ func detectConflict(tx *sql.Tx, rec Record) (bool, error) {
 	}
 	defer rows.Close()
 
+	conflict := false
 	for rows.Next() {
 		var raw string
 		if err := rows.Scan(&raw); err != nil {
@@ -212,13 +218,13 @@ func detectConflict(tx *sql.Tx, rec Record) (bool, error) {
 			return false, fmt.Errorf("decode stored rules: %w", err)
 		}
 		if rulesConflict(rec.Rules, existing) {
-			return true, nil
+			conflict = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return false, fmt.Errorf("iterate conflicts: %w", err)
 	}
-	return false, nil
+	return conflict, nil
 }
 
 func rulesConflict(candidate, existing []Rule) bool {
